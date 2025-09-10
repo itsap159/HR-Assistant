@@ -31,7 +31,7 @@ if uploaded_resume is not None and jd_text.strip():
                 score = match_resume_to_jd(resume_text, jd_text)
                 st.success("Similarity analysis complete!")
                 st.subheader("🎯 Similarity Score")
-                st.info(f"{score[1]} : {score[0]:.2f} ")
+                st.info(f"{score[1]} : {score[0]:.2f}% ")
 
                 # --- AI Analysis ---
                 analysis = analyze_candidate(resume_text, jd_text, score)
