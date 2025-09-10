@@ -1,15 +1,13 @@
 # matcher.py
 from sentence_transformers import SentenceTransformer, util
 import streamlit as st
-from dotenv import load_dotenv
-load_dotenv()
 
 import os
 HF_TOKEN = st.secrets["HF_TOKEN"]
-
+st.write("Model is loading .... please wait")
 @st.cache_resource
 def get_model():
-    return SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", use_auth_token=HF_TOKEN)
+    return SentenceTransformer("all-MiniLM-L6-v2", use_auth_token=HF_TOKEN)
 
 def match_resume_to_jd(resume_text, jd_text):
     model = get_model()
