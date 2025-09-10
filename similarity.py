@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-HF_TOKEN = os.getenv("HF_TOKEN")
-
+HF_TOKEN = os.environ("HF_TOKEN")
+print(HF_TOKEN)
 
 @st.cache_resource
 def get_model():
