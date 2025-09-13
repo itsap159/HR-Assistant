@@ -5,8 +5,11 @@ import streamlit as st
 from datetime import datetime
 import google.generativeai as genai
 genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+from tools.increment_tool import fetch_salary_trends
 
-model = genai.GenerativeModel("gemini-2.5-flash")  # or "gemini-1.5-pro"
+tools = [fetch_salary_trends]
+
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 def analyze_candidate(resume_text, jd_text, score):
     prompt = f"""
@@ -35,3 +38,4 @@ def analyze_candidate(resume_text, jd_text, score):
 
 
     return response.text
+

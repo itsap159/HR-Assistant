@@ -5,3 +5,10 @@ google-generativeai
 python-dotenv
 google-genai
 fpdf
+tavily-python
+langchain
+langchain_core
+langchain_google_genai
+langgraph
+xhtml2pdf
+markdown2
