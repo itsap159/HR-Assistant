@@ -1,9 +1,13 @@
+import io
 import streamlit as st
-from pypdf import PdfReader
+import pandas as pd
+from resume_parser import extract_resume_text, guess_candidate_name
 from compare import analyze_candidate
 from similarity import match_resume_to_jd
 from increment_agent import predict_relocation_salary_simple
 from pi import sanitize_resume_llm, markdown_to_pdf
+from skills_gap import analyze_skills_gap, generate_interview_questions, generate_rank_brief
+from batch import rank_candidates, rank_roles, FIT_TAKEAWAY, fit_reason
 
 # -------------------------
 # Page config
@@ -142,14 +146,27 @@ st.markdown(
         border-color: {p['input_border']} !important;
     }}
     [data-testid="stFileUploaderDropzone"] * {{ color: {p['text_secondary']} !important; }}
-    [data-testid="stBaseButton-secondary"] {{
+    [data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-segmented_control"] {{
         background: {p['input_bg']} !important;
         color: {p['text_primary']} !important;
         border-color: {p['input_border']} !important;
     }}
+    [data-testid="stBaseButton-segmented_control"] p {{ color: {p['text_primary']} !important; }}
+    [data-testid="stBaseButton-tertiary"] {{
+        background: transparent !important;
+        color: {p['primary']} !important;
+        padding: 0.15rem 0.4rem !important;
+    }}
+    [data-testid="stBaseButton-tertiary"] p {{ color: {p['primary']} !important; font-weight: 600; }}
+    [data-testid="stBaseButton-tertiary"]:hover {{ background: {p['input_bg']} !important; }}
     [data-testid="stWidgetLabel"] * {{ color: {p['text_primary']} !important; }}
     [data-testid="stAlertContainer"] * {{ color: {p['text_primary']} !important; }}
     [data-testid="stMarkdownContainer"] {{ color: {p['text_primary']}; }}
+    [data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
+        background: {p['input_bg']} !important;
+        border-color: {p['input_border']} !important;
+    }}
+    [data-testid="stMultiSelect"] span {{ color: {p['text_primary']} !important; }}
 
     [data-testid="stVerticalBlockBorderWrapper"] {{
         border-color: {p['card_border']} !important;
@@ -314,6 +331,54 @@ st.markdown(
     .badge-moderate {{ background: {p['badge_moderate_bg']}; color: {p['badge_moderate_text']}; }}
     .badge-poor {{ background: {p['badge_poor_bg']}; color: {p['badge_poor_text']}; }}
 
+    /* ---- Skill chips ---- */
+    .skill-chip-wrap {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.4rem 0 0.2rem 0; }}
+    .skill-chip {{
+        display: inline-block;
+        padding: 0.28rem 0.75rem;
+        border-radius: 8px;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }}
+    .skill-chip-match {{ background: {p['badge_excellent_bg']}; color: {p['badge_excellent_text']}; }}
+    .skill-chip-gap {{ background: {p['badge_poor_bg']}; color: {p['badge_poor_text']}; }}
+
+    /* ---- Ranked table ---- */
+    .rank-table {{ display: flex; flex-direction: column; }}
+    .rank-item {{
+        padding: 0.7rem 0.25rem;
+        border-bottom: 1px solid {p['card_border']};
+    }}
+    .rank-item:last-child {{ border-bottom: none; }}
+    .rank-row {{
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }}
+    .rank-why {{
+        font-size: 0.82rem;
+        color: {p['text_secondary']};
+        margin-top: 0.35rem;
+        padding-left: 2.6rem;
+    }}
+    .rank-badge {{
+        width: 26px; height: 26px;
+        min-width: 26px;
+        border-radius: 50%;
+        background: {p['step_pending_bg']};
+        color: {p['text_secondary']};
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.76rem;
+        font-weight: 700;
+    }}
+    .rank-name {{ flex: 1; font-weight: 600; color: {p['text_primary']}; }}
+    .rank-score {{ font-weight: 700; color: {p['text_primary']}; min-width: 68px; text-align: right; }}
+    .rank-fit {{ min-width: 108px; text-align: right; }}
+    .rank-sub {{ font-size: 0.78rem; color: {p['text_secondary']}; margin-top: 0.1rem; }}
+    .rank-divider {{ border: none; border-top: 1px solid {p['card_border']}; margin: 0.15rem 0; }}
+
     /* ---- Empty / locked state ---- */
     .empty-state {{
         text-align: center;
@@ -378,6 +443,9 @@ st.markdown(
         font-weight: 600;
         font-size: 0.95rem;
     }}
+
+    /* ---- Mode switch ---- */
+    [data-testid="stSegmentedControl"] {{ margin-bottom: 1.25rem; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -389,14 +457,6 @@ BADGE_CLASS = {
     "Moderate": "badge-moderate",
     "Poor": "badge-poor",
 }
-
-FIT_TAKEAWAY = {
-    "Excellent": "Strong alignment with the job description — a top candidate to prioritize.",
-    "Good": "Solid overlap with the role — worth a closer look.",
-    "Moderate": "Partial match — some gaps against the job description.",
-    "Poor": "Limited overlap with the job description.",
-}
-
 
 def fit_badge(category: str) -> str:
     css_class = BADGE_CLASS.get(category, "badge-moderate")
@@ -449,11 +509,154 @@ def step_row(done: bool, label: str) -> str:
     return f'<div class="step-row"><span class="step-dot {dot_cls}">{mark}</span><span class="{text_cls}">{label}</span></div>'
 
 
+def skill_chip_list(skills: list, variant: str) -> None:
+    if not skills:
+        st.caption("None identified.")
+        return
+    chips = "".join(f'<span class="skill-chip skill-chip-{variant}">{s}</span>' for s in skills)
+    st.markdown(f'<div class="skill-chip-wrap">{chips}</div>', unsafe_allow_html=True)
+
+
+def render_detail_panel(analysis: str, gap: dict) -> None:
+    gcol1, gcol2 = st.columns(2)
+    with gcol1:
+        st.markdown("**✅ Matched Skills**")
+        skill_chip_list(gap["matched_skills"], "match")
+    with gcol2:
+        st.markdown("**⚠️ Missing Skills**")
+        skill_chip_list(gap["missing_skills"], "gap")
+    st.markdown(analysis)
+
+
+def render_role_ranked_table(df: pd.DataFrame, resume_text: str, roles: list) -> None:
+    st.session_state.setdefault("row_analysis", {})
+    st.session_state.setdefault("row_expanded", {})
+    text_by_label = {r["label"]: r["text"] for r in roles}
+    total = len(df)
+    for _, row in df.iterrows():
+        rank = int(row["Rank"])
+        crown = "🏆 " if rank == 1 else ""
+        role_label = row["Role"]
+        rcol1, rcol2, rcol3, rcol4 = st.columns([0.5, 4.1, 1.1, 1.5], vertical_alignment="center")
+        with rcol1:
+            st.markdown(f'<div class="rank-badge">{rank}</div>', unsafe_allow_html=True)
+        with rcol2:
+            st.markdown(f'<div class="rank-name">{crown}{role_label}</div>', unsafe_allow_html=True)
+        with rcol3:
+            st.markdown(f'<div class="rank-score">{row["Score (%)"]:.2f}%</div>', unsafe_allow_html=True)
+        with rcol4:
+            st.markdown(fit_badge(row["Fit"]), unsafe_allow_html=True)
+
+        st.markdown(f'<div class="rank-why">💡 {row["Why"]}</div>', unsafe_allow_html=True)
+
+        key = f"role::{role_label}"
+        is_open = st.session_state.row_expanded.get(key, False)
+        arrow = "▲" if is_open else "▼"
+        _, bcol, _ = st.columns([0.5, 1.5, 5.2])
+        with bcol:
+            if st.button(f"🔍 Detailed analysis {arrow}", key=f"detail_btn_{key}_{rank}", type="tertiary"):
+                if not is_open and key not in st.session_state.row_analysis:
+                    with st.spinner("Analyzing..."):
+                        jd_for_role = text_by_label.get(role_label, "")
+                        analysis = analyze_candidate(resume_text, jd_for_role, (row["Score (%)"], row["Fit"]))
+                        gap = analyze_skills_gap(resume_text, jd_for_role)
+                        st.session_state.row_analysis[key] = {"analysis": analysis, "gap": gap}
+                st.session_state.row_expanded[key] = not is_open
+                st.rerun()
+
+        if is_open and key in st.session_state.row_analysis:
+            with st.container(border=True):
+                render_detail_panel(**st.session_state.row_analysis[key])
+
+        if rank != total:
+            st.markdown('<hr class="rank-divider">', unsafe_allow_html=True)
+
+
+def render_candidate_ranked_table(df: pd.DataFrame, candidates: list, jd_text: str) -> None:
+    st.session_state.setdefault("row_analysis", {})
+    st.session_state.setdefault("row_expanded", {})
+    by_filename = {c["filename"]: c for c in candidates}
+    total = len(df)
+    for _, row in df.iterrows():
+        rank = int(row["Rank"])
+        crown = "🏆 " if rank == 1 else ""
+        filename = row["Candidate"]
+        c = by_filename.get(filename, {})
+        key = f"candidate::{filename}"
+        is_open = st.session_state.row_expanded.get(key, False)
+        arrow = "▲" if is_open else "▼"
+
+        rcol1, rcol2, rcol3, rcol4, rcol5 = st.columns(
+            [0.5, 3.0, 1.0, 1.2, 2.0], vertical_alignment="center"
+        )
+        with rcol1:
+            st.markdown(f'<div class="rank-badge">{rank}</div>', unsafe_allow_html=True)
+        with rcol2:
+            st.markdown(
+                f'<div class="rank-name">{crown}{row["Name"]}</div>'
+                f'<div class="rank-sub">{filename}</div>',
+                unsafe_allow_html=True,
+            )
+        with rcol3:
+            st.markdown(f'<div class="rank-score">{row["Score (%)"]:.2f}%</div>', unsafe_allow_html=True)
+        with rcol4:
+            st.markdown(fit_badge(row["Fit"]), unsafe_allow_html=True)
+        with rcol5:
+            if st.button(f"🔍 Detailed analysis {arrow}", key=f"detail_btn_{key}", type="tertiary"):
+                if not is_open and key not in st.session_state.row_analysis:
+                    with st.spinner("Analyzing..."):
+                        text = c.get("text", "")
+                        analysis = analyze_candidate(text, jd_text, (row["Score (%)"], row["Fit"]))
+                        gap = analyze_skills_gap(text, jd_text)
+                        st.session_state.row_analysis[key] = {"analysis": analysis, "gap": gap}
+                st.session_state.row_expanded[key] = not is_open
+                st.rerun()
+
+        st.markdown(f'<div class="rank-why">💡 {row["Why"]}</div>', unsafe_allow_html=True)
+
+        if is_open and key in st.session_state.row_analysis:
+            with st.container(border=True):
+                render_detail_panel(**st.session_state.row_analysis[key])
+
+        if rank != total:
+            st.markdown('<hr class="rank-divider">', unsafe_allow_html=True)
+
+
+def df_download_buttons(df: pd.DataFrame, base_filename: str) -> None:
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "📥 Download CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            f"{base_filename}.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+    with d2:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Results")
+        st.download_button(
+            "📥 Download Excel",
+            buf.getvalue(),
+            f"{base_filename}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+
 # -------------------------
 # Session state
 # -------------------------
-for k in ["analysis", "score", "salary_prediction", "sanitized_md"]:
+for k in [
+    "analysis", "score", "salary_prediction", "sanitized_md",
+    "skills_gap", "interview_questions", "best_fit_df", "best_fit_roles_used",
+    "batch_ranked_df", "batch_candidates", "compare_results",
+]:
     st.session_state.setdefault(k, None)
+st.session_state.setdefault("jd_roles", [{"label": "Role 1", "text": ""}, {"label": "Role 2", "text": ""}])
+st.session_state.setdefault("row_analysis", {})
+st.session_state.setdefault("row_expanded", {})
 
 # -------------------------
 # Hero header
@@ -463,9 +666,10 @@ st.markdown(
     <div class="hero">
         <div class="hero-badge">🧭</div>
         <h1>HR Resume Assistant</h1>
-        <p>Match candidates to a job description, estimate relocation salary, and strip personal information — all in one place.</p>
+        <p>Match candidates to a job description, rank an entire batch, estimate relocation salary, and strip personal information — all in one place.</p>
         <div class="hero-chips">
             <span class="hero-chip">🎯 Match Score</span>
+            <span class="hero-chip">👥 Batch Rank</span>
             <span class="hero-chip">💰 Salary Insight</span>
             <span class="hero-chip">🧹 PII Sanitize</span>
         </div>
@@ -475,188 +679,436 @@ st.markdown(
 )
 
 # -------------------------
-# Upload + JD input
+# Mode switch
 # -------------------------
-with st.container(border=True):
-    col1, col2 = st.columns(2)
-    with col1:
-        uploaded_resume = st.file_uploader("📂 Upload Resume (PDF only)", type=["pdf"])
-    with col2:
-        jd_text = st.text_area("📝 Paste Job Description here (optional)", height=180)
-
-# -------------------------
-# Sidebar (built after inputs so the stepper reflects live state)
-# -------------------------
-with st.sidebar:
-    is_light = st.session_state.theme == "light"
-    toggled = st.toggle("☀️ Light mode", value=is_light, key="theme_toggle")
-    if toggled != is_light:
-        st.session_state.theme = "light" if toggled else "dark"
-        st.rerun()
-    st.markdown("### 🧭 HR Resume Assistant")
-    st.caption("AI-assisted resume screening, salary insight & PII sanitization.")
-    st.markdown("---")
-    st.markdown("**Progress**")
-    st.markdown(step_row(uploaded_resume is not None, "Upload a resume"), unsafe_allow_html=True)
-    st.markdown(step_row(bool(jd_text.strip()), "Paste a job description"), unsafe_allow_html=True)
-    st.markdown(step_row(uploaded_resume is not None, "Explore the tabs"), unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown("**Connection status**")
-    st.markdown(secret_status("GOOGLE_API_KEY"), unsafe_allow_html=True)
-    st.markdown(secret_status("HF_TOKEN"), unsafe_allow_html=True)
-    st.markdown(secret_status("TAVILY_API_KEY"), unsafe_allow_html=True)
-    st.markdown("---")
-    if st.button("🔄 Start Over", use_container_width=True):
-        for k in ["analysis", "score", "salary_prediction", "sanitized_md"]:
-            st.session_state[k] = None
-        st.rerun()
-
-# -------------------------
-# Landing state — no resume yet
-# -------------------------
-if uploaded_resume is None:
-    st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        feature_card("🎯", "indigo", "Match & Analyze", "Score a resume against a job description and get an AI-written pros/cons breakdown.")
-    with fc2:
-        feature_card("💰", "emerald", "Salary Insights", "Estimate a fair relocation salary using live market trend data.")
-    with fc3:
-        feature_card("🧹", "cyan", "Sanitize & Export", "Strip personal information and export a clean, formatted resume.")
-    st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
-    st.info("👋 Upload a resume above to get started.")
-    st.stop()
-
-reader = PdfReader(uploaded_resume)
-resume_text = " ".join([page.extract_text() for page in reader.pages if page.extract_text()])
-
-if not resume_text.strip():
-    st.error("Could not extract any text from the PDF.")
-    st.stop()
-
-st.markdown(
-    f"""
-    <div class="file-strip">
-        ✅ <b>{uploaded_resume.name}</b> loaded — {len(resume_text.split())} words extracted.
-    </div>
-    """,
-    unsafe_allow_html=True,
+mode = st.segmented_control(
+    "Mode",
+    ["📄 Single Candidate", "👥 Batch & Compare"],
+    default="📄 Single Candidate",
+    label_visibility="collapsed",
+    key="app_mode",
 )
+if mode is None:
+    mode = "📄 Single Candidate"
 
-tab_match, tab_salary, tab_sanitize = st.tabs(
-    ["🎯 Match & Analyze", "💰 Salary Insights", "🧹 Sanitize & Export"]
-)
+uploaded_resume = None
+jd_text = ""
+resume_text = ""
 
-# -------------------------
-# Tab 1: Match & Analyze
-# -------------------------
-with tab_match:
-    if not jd_text.strip():
-        with st.container(border=True):
-            empty_state("🔒", "Job description required", "Paste a job description above to unlock candidate matching.")
-    else:
-        if st.button("🔍 Analyze Candidate", type="primary"):
-            with st.spinner("Analyzing candidate..."):
-                try:
-                    score = match_resume_to_jd(resume_text, jd_text)
-                    analysis = analyze_candidate(resume_text, jd_text, score)
-                    st.session_state.score = score
-                    st.session_state.analysis = analysis
-                except Exception as e:
-                    st.error(f"Error during analysis: {e}")
-
-        if st.session_state.score:
-            score_val, fit_category = st.session_state.score
-            with st.container(border=True):
-                section_eyebrow("🎯", "Match Result", "indigo")
-                mcol, bcol = st.columns([1, 2])
-                with mcol:
-                    st.metric("Similarity Score", f"{score_val:.2f}%")
-                with bcol:
-                    st.markdown("<br>" + fit_badge(fit_category), unsafe_allow_html=True)
-                    st.caption(FIT_TAKEAWAY.get(fit_category, ""))
-                st.progress(min(int(score_val), 100) / 100)
-
-        if st.session_state.analysis:
-            with st.container(border=True):
-                section_eyebrow("📋", "Candidate Analysis", "indigo")
-                st.markdown(st.session_state.analysis)
-            st.download_button(
-                label="📥 Download Analysis as Markdown",
-                data=st.session_state.analysis,
-                file_name="candidate_analysis.md",
-                mime="text/markdown",
+# =========================================================
+# SINGLE CANDIDATE MODE
+# =========================================================
+if mode == "📄 Single Candidate":
+    with st.container(border=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            uploaded_resume = st.file_uploader(
+                "📂 Upload Resume (PDF or DOCX)", type=["pdf", "docx"], key="single_resume_uploader"
+            )
+        with col2:
+            jd_text = st.text_area(
+                "📝 Paste Job Description here (optional)", height=180, key="single_jd_text"
             )
 
-# -------------------------
-# Tab 2: Salary Insights
-# -------------------------
-with tab_salary:
-    if not jd_text.strip():
-        with st.container(border=True):
-            empty_state("🔒", "Job description required", "Paste a job description above to unlock salary prediction.")
-    else:
-        with st.container(border=True):
-            section_eyebrow("💰", "Relocation Details", "emerald")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                current_salary = st.number_input("Current salary (INR)", min_value=0, step=1000)
-            with c2:
-                current_location = st.text_input("Current location")
-            with c3:
-                new_location = st.text_input("New location")
+    with st.sidebar:
+        is_light = st.session_state.theme == "light"
+        toggled = st.toggle("☀️ Light mode", value=is_light, key="theme_toggle")
+        if toggled != is_light:
+            st.session_state.theme = "light" if toggled else "dark"
+            st.rerun()
+        st.markdown("### 🧭 HR Resume Assistant")
+        st.caption("AI-assisted resume screening, salary insight & PII sanitization.")
+        st.markdown("---")
+        st.markdown("**Progress**")
+        st.markdown(step_row(uploaded_resume is not None, "Upload a resume"), unsafe_allow_html=True)
+        st.markdown(step_row(bool(jd_text.strip()), "Paste a job description"), unsafe_allow_html=True)
+        st.markdown(step_row(uploaded_resume is not None, "Explore the tabs"), unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("**Connection status**")
+        st.markdown(secret_status("GOOGLE_API_KEY"), unsafe_allow_html=True)
+        st.markdown(secret_status("HF_TOKEN"), unsafe_allow_html=True)
+        st.markdown(secret_status("TAVILY_API_KEY"), unsafe_allow_html=True)
+        st.markdown("---")
+        if st.button("🔄 Start Over", use_container_width=True):
+            for k in [
+                "analysis", "score", "salary_prediction", "sanitized_md",
+                "skills_gap", "interview_questions", "best_fit_df", "best_fit_roles_used",
+            ]:
+                st.session_state[k] = None
+            st.session_state.row_analysis = {}
+            st.session_state.jd_roles = [{"label": "Role 1", "text": ""}, {"label": "Role 2", "text": ""}]
+            st.rerun()
 
-            if st.button("🔮 Predict Salary", type="primary"):
-                if current_salary > 0:
-                    with st.spinner("Fetching salary prediction..."):
+    if uploaded_resume is None:
+        st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            feature_card("🎯", "indigo", "Match & Analyze", "Score a resume against a job description, see a skills-gap breakdown, and get suggested interview questions.")
+        with fc2:
+            feature_card("💰", "emerald", "Salary Insights", "Estimate a fair relocation salary using live market trend data.")
+        with fc3:
+            feature_card("🧹", "cyan", "Sanitize & Export", "Strip personal information and export a clean, formatted resume.")
+        st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
+        st.info("👋 Upload a resume above to get started.")
+        st.stop()
+
+    resume_text = extract_resume_text(uploaded_resume)
+
+    if not resume_text.strip():
+        st.error("Could not extract any text from that file.")
+        st.stop()
+
+    candidate_name = guess_candidate_name(resume_text, uploaded_resume.name)
+    st.markdown(
+        f"""
+        <div class="file-strip">
+            ✅ <b>{candidate_name}</b> ({uploaded_resume.name}) loaded — {len(resume_text.split())} words extracted.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_match, tab_bestfit, tab_salary, tab_sanitize = st.tabs(
+        ["🎯 Match & Analyze", "🧭 Best-Fit Role", "💰 Salary Insights", "🧹 Sanitize & Export"]
+    )
+
+    # ---- Tab: Match & Analyze ----
+    with tab_match:
+        if not jd_text.strip():
+            with st.container(border=True):
+                empty_state("🔒", "Job description required", "Paste a job description above to unlock candidate matching.")
+        else:
+            if st.button("🔍 Analyze Candidate", type="primary"):
+                with st.spinner("Analyzing candidate..."):
+                    try:
+                        score = match_resume_to_jd(resume_text, jd_text)
+                        analysis = analyze_candidate(resume_text, jd_text, score)
+                        gap = analyze_skills_gap(resume_text, jd_text)
+                        st.session_state.score = score
+                        st.session_state.analysis = analysis
+                        st.session_state.skills_gap = gap
+                        st.session_state.interview_questions = None
+                    except Exception as e:
+                        st.error(f"Error during analysis: {e}")
+
+            if st.session_state.score:
+                score_val, fit_category = st.session_state.score
+                with st.container(border=True):
+                    section_eyebrow("🎯", "Match Result", "indigo")
+                    mcol, bcol = st.columns([1, 2])
+                    with mcol:
+                        st.metric("Similarity Score", f"{score_val:.2f}%")
+                    with bcol:
+                        st.markdown("<br>" + fit_badge(fit_category), unsafe_allow_html=True)
+                        st.caption(FIT_TAKEAWAY.get(fit_category, ""))
+                    st.progress(min(int(score_val), 100) / 100)
+
+            if st.session_state.analysis:
+                with st.container(border=True):
+                    section_eyebrow("📋", "Candidate Analysis", "indigo")
+                    st.markdown(st.session_state.analysis)
+                st.download_button(
+                    label="📥 Download Analysis as Markdown",
+                    data=st.session_state.analysis,
+                    file_name="candidate_analysis.md",
+                    mime="text/markdown",
+                )
+
+            if st.session_state.skills_gap:
+                with st.container(border=True):
+                    section_eyebrow("📊", "Skills Gap", "emerald")
+                    gcol1, gcol2 = st.columns(2)
+                    with gcol1:
+                        st.markdown("**✅ Matched Skills**")
+                        skill_chip_list(st.session_state.skills_gap["matched_skills"], "match")
+                    with gcol2:
+                        st.markdown("**⚠️ Missing Skills**")
+                        skill_chip_list(st.session_state.skills_gap["missing_skills"], "gap")
+
+                if st.button("❓ Generate Interview Questions"):
+                    with st.spinner("Drafting interview questions..."):
                         try:
-                            st.session_state.salary_prediction = predict_relocation_salary_simple(
-                                resume_text, jd_text, current_salary, new_location, current_location
+                            st.session_state.interview_questions = generate_interview_questions(
+                                resume_text, jd_text, st.session_state.skills_gap["missing_skills"]
                             )
                         except Exception as e:
-                            st.error(f"Error predicting salary: {e}")
-                else:
-                    st.warning("Please enter a valid current salary (INR).")
+                            st.error(f"Error generating questions: {e}")
 
-        if st.session_state.salary_prediction:
+                if st.session_state.interview_questions:
+                    with st.container(border=True):
+                        section_eyebrow("❓", "Suggested Interview Questions", "emerald")
+                        st.markdown(st.session_state.interview_questions)
+
+    # ---- Tab: Best-Fit Role (multi-JD matching) ----
+    with tab_bestfit:
+        st.caption("Compare this one candidate against several open roles to see which they fit best.")
+        for i, role in enumerate(st.session_state.jd_roles):
             with st.container(border=True):
-                section_eyebrow("📊", "Salary Recommendation", "emerald")
-                st.markdown(st.session_state.salary_prediction)
+                rcol1, rcol2 = st.columns([4, 1])
+                with rcol1:
+                    role["label"] = st.text_input("Role name", value=role["label"], key=f"role_label_{i}")
+                with rcol2:
+                    st.markdown("<div style='height: 1.85rem'></div>", unsafe_allow_html=True)
+                    if st.button("✕ Remove", key=f"role_remove_{i}", use_container_width=True):
+                        if len(st.session_state.jd_roles) > 1:
+                            st.session_state.jd_roles.pop(i)
+                            st.rerun()
+                role["text"] = st.text_area(
+                    "Job description", value=role["text"], key=f"role_text_{i}", height=120
+                )
 
-# -------------------------
-# Tab 3: Sanitize & Export
-# -------------------------
-with tab_sanitize:
-    if st.button("🧹 Sanitize & Format Resume", type="primary"):
-        with st.spinner("Processing with LLM..."):
-            try:
-                st.session_state.sanitized_md = sanitize_resume_llm(resume_text)
-            except Exception as e:
-                st.error(f"Error sanitizing resume: {e}")
+        if st.button("➕ Add another role"):
+            st.session_state.jd_roles.append({"label": f"Role {len(st.session_state.jd_roles) + 1}", "text": ""})
+            st.rerun()
 
-    if st.session_state.sanitized_md:
+        if st.button("🧭 Find Best Fit", type="primary"):
+            valid_roles = [r for r in st.session_state.jd_roles if r["text"].strip()]
+            if not valid_roles:
+                st.warning("Add at least one job description with text.")
+            else:
+                with st.spinner("Scoring roles..."):
+                    df = rank_roles(resume_text, valid_roles)
+                with st.spinner("Summarizing why each role ranked where it did..."):
+                    text_by_label = {r["label"]: r["text"] for r in valid_roles}
+                    briefs = []
+                    for _, row in df.iterrows():
+                        try:
+                            briefs.append(generate_rank_brief(
+                                resume_text, text_by_label[row["Role"]], row["Score (%)"], row["Fit"]
+                            ))
+                        except Exception:
+                            briefs.append(fit_reason(row["Fit"]))
+                    df["Why"] = briefs
+                st.session_state.best_fit_df = df
+                st.session_state.best_fit_roles_used = valid_roles
+                st.session_state.row_analysis = {}
+
+        if st.session_state.best_fit_df is not None:
+            with st.container(border=True):
+                section_eyebrow("🧭", "Best-Fit Ranking", "indigo")
+                render_role_ranked_table(
+                    st.session_state.best_fit_df, resume_text, st.session_state.best_fit_roles_used
+                )
+            df_download_buttons(st.session_state.best_fit_df, "best_fit_roles")
+
+    # ---- Tab: Salary Insights ----
+    with tab_salary:
+        if not jd_text.strip():
+            with st.container(border=True):
+                empty_state("🔒", "Job description required", "Paste a job description above to unlock salary prediction.")
+        else:
+            with st.container(border=True):
+                section_eyebrow("💰", "Relocation Details", "emerald")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    current_salary = st.number_input("Current salary (INR)", min_value=0, step=1000)
+                with c2:
+                    current_location = st.text_input("Current location")
+                with c3:
+                    new_location = st.text_input("New location")
+
+                if st.button("🔮 Predict Salary", type="primary"):
+                    if current_salary > 0:
+                        with st.spinner("Fetching salary prediction..."):
+                            try:
+                                st.session_state.salary_prediction = predict_relocation_salary_simple(
+                                    resume_text, jd_text, current_salary, new_location, current_location
+                                )
+                            except Exception as e:
+                                st.error(f"Error predicting salary: {e}")
+                    else:
+                        st.warning("Please enter a valid current salary (INR).")
+
+            if st.session_state.salary_prediction:
+                with st.container(border=True):
+                    section_eyebrow("📊", "Salary Recommendation", "emerald")
+                    st.markdown(st.session_state.salary_prediction)
+
+    # ---- Tab: Sanitize & Export ----
+    with tab_sanitize:
+        if st.button("🧹 Sanitize & Format Resume", type="primary"):
+            with st.spinner("Processing with LLM..."):
+                try:
+                    st.session_state.sanitized_md = sanitize_resume_llm(resume_text)
+                except Exception as e:
+                    st.error(f"Error sanitizing resume: {e}")
+
+        if st.session_state.sanitized_md:
+            with st.container(border=True):
+                section_eyebrow("📄", "Sanitized Resume", "cyan")
+                st.markdown(st.session_state.sanitized_md)
+
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    label="📥 Download as Markdown",
+                    data=st.session_state.sanitized_md,
+                    file_name="resume_sanitized.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            with dl2:
+                pdf_buffer = markdown_to_pdf(st.session_state.sanitized_md)
+                st.download_button(
+                    label="📥 Download as PDF",
+                    data=pdf_buffer,
+                    file_name="resume_sanitized.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+        else:
+            with st.container(border=True):
+                empty_state("🧹", "No sanitized version yet", "Click the button above to generate a clean, PII-free resume.")
+
+# =========================================================
+# BATCH & COMPARE MODE
+# =========================================================
+else:
+    with st.container(border=True):
+        uploaded_batch = st.file_uploader(
+            "📂 Upload Resumes (PDF or DOCX, multiple allowed)",
+            type=["pdf", "docx"],
+            accept_multiple_files=True,
+            key="batch_resume_uploader",
+        )
+        batch_jd_text = st.text_area(
+            "📝 Paste Job Description here", height=180, key="batch_jd_text"
+        )
+
+    with st.sidebar:
+        is_light = st.session_state.theme == "light"
+        toggled = st.toggle("☀️ Light mode", value=is_light, key="theme_toggle")
+        if toggled != is_light:
+            st.session_state.theme = "light" if toggled else "dark"
+            st.rerun()
+        st.markdown("### 🧭 HR Resume Assistant")
+        st.caption("AI-assisted resume screening, salary insight & PII sanitization.")
+        st.markdown("---")
+        st.markdown("**Batch mode**")
+        n_queued = len(uploaded_batch) if uploaded_batch else 0
+        st.caption(f"{n_queued} resume(s) queued for ranking.")
+        st.markdown("---")
+        st.markdown("**Connection status**")
+        st.markdown(secret_status("GOOGLE_API_KEY"), unsafe_allow_html=True)
+        st.markdown(secret_status("HF_TOKEN"), unsafe_allow_html=True)
+        st.markdown(secret_status("TAVILY_API_KEY"), unsafe_allow_html=True)
+        st.markdown("---")
+        if st.button("🔄 Start Over", use_container_width=True):
+            for k in ["batch_ranked_df", "batch_candidates", "compare_results"]:
+                st.session_state[k] = None
+            st.session_state.row_analysis = {}
+            st.rerun()
+
+    if not uploaded_batch:
+        st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            feature_card("👥", "indigo", "Rank a Batch", "Upload every resume for a role and get them scored and ranked against the job description.")
+        with fc2:
+            feature_card("🔍", "emerald", "Compare Finalists", "Pick 2-4 top candidates for a side-by-side pros/cons and skills-gap comparison.")
+        st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
+        st.info("👋 Upload two or more resumes above to get started.")
+        st.stop()
+
+    if not batch_jd_text.strip():
         with st.container(border=True):
-            section_eyebrow("📄", "Sanitized Resume", "cyan")
-            st.markdown(st.session_state.sanitized_md)
+            empty_state("🔒", "Job description required", "Paste a job description above to rank the uploaded resumes.")
+        st.stop()
 
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            st.download_button(
-                label="📥 Download as Markdown",
-                data=st.session_state.sanitized_md,
-                file_name="resume_sanitized.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-        with dl2:
-            pdf_buffer = markdown_to_pdf(st.session_state.sanitized_md)
-            st.download_button(
-                label="📥 Download as PDF",
-                data=pdf_buffer,
-                file_name="resume_sanitized.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-    else:
+    candidates = []
+    for f in uploaded_batch:
+        text = extract_resume_text(f)
+        if text.strip():
+            candidates.append({
+                "filename": f.name,
+                "text": text,
+                "name": guess_candidate_name(text, f.name),
+                "bytes": f.getvalue(),
+                "mime": f.type,
+            })
+
+    st.markdown(
+        f"""
+        <div class="file-strip">
+            ✅ <b>{len(candidates)} resume(s)</b> loaded and ready to rank.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("📊 Rank Candidates", type="primary"):
+        with st.spinner("Scoring candidates..."):
+            df = rank_candidates(candidates, batch_jd_text)
+        with st.spinner("Summarizing why each candidate ranked where they did..."):
+            text_by_filename = {c["filename"]: c["text"] for c in candidates}
+            briefs = []
+            for _, row in df.iterrows():
+                try:
+                    briefs.append(generate_rank_brief(
+                        text_by_filename[row["Candidate"]], batch_jd_text, row["Score (%)"], row["Fit"]
+                    ))
+                except Exception:
+                    briefs.append(fit_reason(row["Fit"]))
+            df["Why"] = briefs
+        st.session_state.batch_ranked_df = df
+        st.session_state.batch_candidates = candidates
+        st.session_state.compare_results = None
+        st.session_state.row_analysis = {}
+
+    if st.session_state.batch_ranked_df is not None:
         with st.container(border=True):
-            empty_state("🧹", "No sanitized version yet", "Click the button above to generate a clean, PII-free resume.")
+            section_eyebrow("📊", "Ranked Candidates", "indigo")
+            render_candidate_ranked_table(
+                st.session_state.batch_ranked_df, st.session_state.batch_candidates, batch_jd_text
+            )
+        df_download_buttons(st.session_state.batch_ranked_df, "ranked_candidates")
+
+        st.markdown("---")
+        section_eyebrow("🔍", "Side-by-Side Comparison", "emerald")
+        name_by_filename = {c["filename"]: c["name"] for c in st.session_state.batch_candidates}
+        filenames = st.session_state.batch_ranked_df["Candidate"].tolist()
+        selected = st.multiselect(
+            "Select 2-4 candidates to compare in depth",
+            filenames,
+            format_func=lambda fn: name_by_filename.get(fn, fn),
+            max_selections=4,
+        )
+
+        if st.button("🔍 Compare Selected", type="primary"):
+            if len(selected) < 2:
+                st.warning("Select at least 2 candidates to compare.")
+            else:
+                with st.spinner("Comparing candidates..."):
+                    results = {}
+                    for filename in selected:
+                        c = next(c for c in st.session_state.batch_candidates if c["filename"] == filename)
+                        score = match_resume_to_jd(c["text"], batch_jd_text)
+                        analysis = analyze_candidate(c["text"], batch_jd_text, score)
+                        gap = analyze_skills_gap(c["text"], batch_jd_text)
+                        results[filename] = {
+                            "score": score, "analysis": analysis, "gap": gap,
+                            "name": c["name"], "bytes": c["bytes"], "mime": c["mime"],
+                        }
+                    st.session_state.compare_results = results
+
+        if st.session_state.compare_results:
+            cols = st.columns(len(st.session_state.compare_results))
+            for col, (filename, data) in zip(cols, st.session_state.compare_results.items()):
+                with col:
+                    with st.container(border=True):
+                        section_eyebrow("👤", data["name"], "cyan")
+                        st.caption(filename)
+                        st.download_button(
+                            "📄 Download resume", data=data["bytes"], file_name=filename,
+                            mime=data["mime"] or "application/octet-stream",
+                            key=f"dl_compare_{filename}", use_container_width=True,
+                        )
+                        score_val, fit_cat = data["score"]
+                        st.metric("Score", f"{score_val:.2f}%")
+                        st.markdown(fit_badge(fit_cat), unsafe_allow_html=True)
+                        st.markdown("**✅ Matched**")
+                        skill_chip_list(data["gap"]["matched_skills"], "match")
+                        st.markdown("**⚠️ Missing**")
+                        skill_chip_list(data["gap"]["missing_skills"], "gap")
+                        with st.expander("Full analysis"):
+                            st.markdown(data["analysis"])
