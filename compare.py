@@ -29,7 +29,13 @@ def analyze_candidate(resume_text, jd_text, score):
     3. Explain overall FIT with the JD (good, moderate, poor) and why.
     4. Write a short professional SUMMARY NOTE for HR to share with the hiring manager.
     5. Give a final verdict.
-    
+
+    Formatting rules (follow exactly):
+    - Output clean Markdown using exactly these section headers, in this order: "## Pros", "## Cons", "## Overall Fit", "## Summary Note", "## Final Verdict".
+    - Use "-" bullet points under Pros and Cons, one point per line.
+    - Keep paragraphs under Overall Fit, Summary Note, and Final Verdict short and scannable.
+    - Do not add any commentary or text outside these five sections.
+
     This is the current date which might help in analyzing : {datetime.now()}
     """
 
