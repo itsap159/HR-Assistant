@@ -9,7 +9,7 @@ from tools.increment_tool import fetch_salary_trends
 
 tools = [fetch_salary_trends]
 
-model = genai.GenerativeModel("gemini-2.5-flash")
+model = genai.GenerativeModel("gemini-3.5-flash-lite")
 
 def analyze_candidate(resume_text, jd_text, score):
     prompt = f"""
